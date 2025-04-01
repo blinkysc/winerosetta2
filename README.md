@@ -30,8 +30,8 @@ The tool works by:
 
 ### Installation and Usage
 
-1. Place `WineRosetta2.exe` in the same directory as your `wow.exe` executable
-2. Simply run `WineRosetta2.exe` (no command-line arguments are needed)
+1. Place `WineRosetta.exe` in the same directory as your `wow.exe` executable
+2. Simply run `WineRosetta.exe` (no command-line arguments are needed)
 
 The tool will automatically locate and launch the `wow.exe` file in the same directory. It does not accept any command-line arguments.
 
@@ -74,7 +74,18 @@ This implementation is based on the work by [Lifeisawful](https://github.com/Lif
 
 ## License
 
-Please refer to the original project for license information.
+The original WineRosetta project by [Lifeisawful](https://github.com/Lifeisawful/winerosetta) is licensed under the MIT license. Since this implementation is derived from that work, it inherits the same license terms.
+
+The MIT license is a permissive license that allows you to:
+- Use the code commercially
+- Modify the code
+- Distribute the code
+- Use the code privately
+- Sublicense the code
+
+The main requirement is that you include the original copyright notice and license terms in any copy of the software/source.
+
+This means you are free to create your own public GitHub repository with this code, as long as you maintain the original MIT license and provide attribution to the original author.
 
 ## Technical Details
 
