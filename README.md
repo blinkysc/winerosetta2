@@ -96,12 +96,3 @@ The ARPL instruction adjusts the Requested Privilege Level (RPL) bits of a segme
 ### FCOMP Instruction
 
 Some variants of the FCOMP floating-point comparison instruction may cause compatibility issues. WineRosetta replaces these with more compatible variants.
-
-## Statistics
-
-WineRosetta tracks statistics on how many instructions it has patched:
-- Total patches applied
-- ARPL instructions fixed
-- FCOMP instructions fixed
-
-These statistics are maintained in global state but are not currently exposed via an API.
