@@ -1,147 +1,390 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <string>
+#include <windows.h>
 #include <cstdint>
-#include <cstdio> // For rename
+#include <cstdio>      // For sprintf_s (safer alternative to wsprintfA)
+#include <tlhelp32.h>
+#include <winnt.h>    // For CONTEXT structure definitions
+#include <atomic>     // For std::atomic
 
 // --- Constants ---
-// Define opcodes as they appear as byte sequences in the file
+// Opcodes are viewed as little-endian words (byte sequence in memory)
 // ARPL AX, AX (Bytes: 63 D0)
-constexpr uint16_t ARPL_OPCODE_CHECK = 0xD063; // Check as little-endian WORD
-constexpr uint8_t ARPL_BYTE_1 = 0x63;
-constexpr uint8_t ARPL_BYTE_2 = 0xD0;
+constexpr uint16_t ARPL_OPCODE_CHECK = 0xD063; // WORD representation of 63 D0
 
 // FCOMP ST(1) (Bytes: D8 DC)
-constexpr uint16_t FCOMP_CHECK_OPCODE = 0xDCD8; // Check as little-endian WORD
-constexpr uint8_t FCOMP_BYTE_1 = 0xD8;
-constexpr uint8_t FCOMP_BYTE_2 = 0xDC;
+constexpr uint16_t FCOMP_CHECK_OPCODE = 0xDCD8; // WORD representation of D8 DC
 
 // FCOMP ST(0) (Bytes: D8 D8) - Patch target for FCOMP ST(1)
-constexpr uint8_t FCOMP_ST0_BYTE_1 = 0xD8;
-constexpr uint8_t FCOMP_ST0_BYTE_2 = 0xD8;
+constexpr uint16_t FCOMP_ST0_OPCODE   = 0xD8D8; // WORD representation of D8 D8
 
 // Two NOP instructions (Bytes: 90 90) - Patch target for ARPL
-constexpr uint8_t NOP_BYTE_1 = 0x90;
-constexpr uint8_t NOP_BYTE_2 = 0x90;
+constexpr uint16_t NOP_2BYTES         = 0x9090; // WORD representation of 90 90
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_executable>" << std::endl;
-        std::cerr << "Example: " << argv[0] << " wow.exe" << std::endl;
-        std::cerr << "\nThis will create a backup (.bak) and patch the original file." << std::endl;
-        return 1;
+// For ZF flag in EFlags (bit 6)
+constexpr DWORD EFLAGS_ZF_FLAG = 0x40;
+// For RPL mask (bits 0-1) - Note: Not used in current patching logic, kept for context
+constexpr uint16_t SELECTOR_RPL_MASK = 0x3;
+
+// Global state
+struct WineRosettaState {
+    PVOID vehHandler = nullptr;
+    std::atomic<LONG> patchesApplied{0}; // Use {} initialization
+    std::atomic<LONG> arplFixed{0};      // Use {} initialization
+    std::atomic<LONG> fcompFixed{0};     // Use {} initialization
+    HANDLE hProcess = NULL;
+    HANDLE hThread = NULL;
+    DWORD processId = 0;
+} g_state; // Use std::atomic for thread safety
+
+// --- Function Prototypes ---
+LONG WINAPI VectoredHandler(EXCEPTION_POINTERS* ExceptionInfo);
+void OptimizeMemoryBlock(void* baseAddr, SIZE_T size);
+DWORD WINAPI OptimizeThread(LPVOID param);
+void SetupExceptionHandlerAndOptimizer();
+BOOL CreateAndSetupProcess(const char* exePath);
+
+// --- Implementation ---
+
+// Vectored Exception Handler to catch and patch instructions at runtime
+LONG WINAPI VectoredHandler(EXCEPTION_POINTERS* ExceptionInfo) {
+    // Only handle illegal instruction exceptions
+    if (ExceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
+        return EXCEPTION_CONTINUE_SEARCH; // Pass on other exceptions
     }
 
-    std::string input_filepath = argv[1];
-    std::string backup_filepath = input_filepath + ".bak";
-    std::cout << "Patching: " << input_filepath << std::endl;
+    // Get faulting address and context (assuming 32-bit target)
+    PCONTEXT pContext = ExceptionInfo->ContextRecord;
+    ULONG_PTR faultAddr = static_cast<ULONG_PTR>(pContext->Eip); // Use Eip for 32-bit
 
-    // 1. Create a backup
-    // Note: On Windows, rename might fail if the backup already exists.
-    // A more robust solution would check first or use CopyFile.
-    // std::remove(backup_filepath.c_str()); // Try removing old backup first
-    if (std::rename(input_filepath.c_str(), backup_filepath.c_str()) != 0) {
-         // If rename fails (e.g., cross-device link), try copying
-         std::ifstream src(input_filepath, std::ios::binary);
-         if (!src) {
-            std::cerr << "Error: Cannot open input file for backup: " << input_filepath << std::endl;
-             return 1;
-         }
-         std::ofstream dst(backup_filepath, std::ios::binary);
-         if (!dst) {
-            std::cerr << "Error: Cannot create backup file: " << backup_filepath << std::endl;
-             src.close();
-             return 1;
-         }
-         dst << src.rdbuf();
-         src.close();
-         dst.close();
-         std::cout << "Created backup (by copying): " << backup_filepath << std::endl;
+    // Check if the address is readable (at least 2 bytes for the opcode)
+    // Using VirtualQuery is generally preferred over IsBadReadPtr
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(faultAddr), &mbi, sizeof(mbi)) == 0 ||
+        !(mbi.State & MEM_COMMIT) || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
+         // Cannot read or not committed memory
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // Ensure we can read at least 2 bytes within the allocated region
+    if (faultAddr + 1 >= reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize) {
+        // Trying to read past the end of the region
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+
+    uint16_t opcode = *reinterpret_cast<uint16_t*>(faultAddr);
+    bool patched = false;
+    DWORD oldProtect;
+
+    // --- Handle ARPL (Specific form ARPL AX, AX -> Bytes 63 D0) ---
+    if (opcode == ARPL_OPCODE_CHECK) {
+        // Attempt to make the memory writable
+        if (VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            *reinterpret_cast<uint16_t*>(faultAddr) = NOP_2BYTES; // Patch with NOPs
+            // Restore original protection
+            DWORD ignored; // Variable to receive the old protection value on the second call
+            VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, oldProtect, &ignored);
+            // Flush instruction cache for the patched memory
+            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(faultAddr), 2);
+
+            g_state.arplFixed++; // Increment atomic counter
+            patched = true;
+
+             // Since we NOP'd the instruction, advance EIP past the 2 bytes
+            pContext->Eip += 2;
+        }
+    }
+    // --- Handle FCOMP ST(1) (Bytes D8 DC) ---
+    else if (opcode == FCOMP_CHECK_OPCODE) {
+         // Attempt to make the memory writable
+        if (VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            *reinterpret_cast<uint16_t*>(faultAddr) = FCOMP_ST0_OPCODE; // Patch with FCOMP ST(0)
+             // Restore original protection
+            DWORD ignored;
+            VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, oldProtect, &ignored);
+             // Flush instruction cache
+            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(faultAddr), 2);
+
+            g_state.fcompFixed++; // Increment atomic counter
+            patched = true;
+
+            // EIP does NOT need to be advanced here, because we replaced the
+            // instruction in place. The CPU will execute the *new* instruction
+            // at the same address upon continuation.
+        }
+    }
+
+    if (patched) {
+        g_state.patchesApplied++;
+        return EXCEPTION_CONTINUE_EXECUTION; // Resume execution at (potentially advanced) Eip
     } else {
-         std::cout << "Created backup (by renaming): " << backup_filepath << std::endl;
+        // We didn't handle or couldn't patch this specific illegal instruction
+        return EXCEPTION_CONTINUE_SEARCH; // Let other handlers or the OS deal with it
+    }
+}
+
+
+// Scans and patches a block of memory proactively
+void OptimizeMemoryBlock(void* baseAddr, SIZE_T size) {
+    if (!baseAddr || size < 2) {
+        return;
+    }
+
+    // Check if memory is executable
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(baseAddr, &mbi, sizeof(mbi)) == 0) {
+        return; // Failed to query memory info
+    }
+
+    // Check for execute flags (more robustly)
+    bool isExecutable = (mbi.Protect & PAGE_EXECUTE) ||
+                        (mbi.Protect & PAGE_EXECUTE_READ) ||
+                        (mbi.Protect & PAGE_EXECUTE_READWRITE) ||
+                        (mbi.Protect & PAGE_EXECUTE_WRITECOPY);
+
+    if (!isExecutable || !(mbi.State & MEM_COMMIT) || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
+        return; // Not committed, executable or accessible
+    }
+
+    // Make memory temporarily writable
+    DWORD oldProtect;
+    // Check if already writable, otherwise try to make it writable
+    bool needsRestore = !(mbi.Protect & PAGE_EXECUTE_READWRITE || mbi.Protect & PAGE_READWRITE || mbi.Protect & PAGE_WRITECOPY);
+    bool canWrite = !needsRestore;
+
+    if (needsRestore) {
+        if (!VirtualProtect(baseAddr, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            // Couldn't make writable, skip.
+            return;
+        }
+        canWrite = true;
+    } else {
+        oldProtect = mbi.Protect; // Store current protection if already writable
     }
 
 
-    // 2. Open the backup file for reading
-    std::ifstream infile(backup_filepath, std::ios::binary | std::ios::ate); // Open at end to get size
-    if (!infile) {
-        std::cerr << "Error: Cannot open backup file for reading: " << backup_filepath << std::endl;
-        // Attempt to restore original filename if rename was used
-        std::rename(backup_filepath.c_str(), input_filepath.c_str());
-        return 1;
+    if (!canWrite) return; // Should not happen, but safety check
+
+
+    uint8_t* start = static_cast<uint8_t*>(baseAddr);
+    // Calculate end pointer carefully to avoid going out of bounds
+    uint8_t* region_end = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    uint8_t* effective_end = start + size;
+    uint8_t* limit = (effective_end < region_end) ? effective_end : region_end;
+
+    // Ensure we don't read past the actual memory region limit by 1 byte for the opcode word
+    if (limit > start) {
+         limit--;
+    } else {
+        // Region is too small (0 or 1 byte)
+         if (needsRestore) VirtualProtect(baseAddr, size, oldProtect, &oldProtect);
+         return;
     }
 
-    std::streamsize size = infile.tellg();
-    infile.seekg(0, std::ios::beg); // Go back to the beginning
 
-    // 3. Read the entire file into memory
-    std::vector<uint8_t> buffer(size);
-    if (!infile.read(reinterpret_cast<char*>(buffer.data()), size)) {
-        std::cerr << "Error: Failed to read file content into buffer." << std::endl;
-        infile.close();
-        std::rename(backup_filepath.c_str(), input_filepath.c_str()); // Restore original
-        return 1;
-    }
-    infile.close(); // Close backup file
-
-    // 4. Scan and patch the buffer
-    long arpl_patches = 0;
-    long fcomp_patches = 0;
     bool changed = false;
 
-    // Iterate up to size-1 to allow reading 2 bytes
-    for (size_t i = 0; (i + 1) < buffer.size(); ++i) {
-        // Read potential 16-bit opcode from buffer (little-endian)
-        uint16_t current_opcode = *reinterpret_cast<uint16_t*>(&buffer[i]);
+    for (uint8_t* p = start; p < limit; /* increment in loop */) {
+        // Read potential 16-bit opcode carefully
+        uint16_t opcode = *reinterpret_cast<uint16_t*>(p);
+        bool instruction_patched = false;
 
-        // Check for ARPL (Bytes 63 D0)
-        if (current_opcode == ARPL_OPCODE_CHECK) {
-            buffer[i] = NOP_BYTE_1;     // Patch first byte (63 -> 90)
-            buffer[i + 1] = NOP_BYTE_2; // Patch second byte (D0 -> 90)
-            arpl_patches++;
+        // Check for ARPL (Specific form 63 D0 -> ARPL AX, AX)
+        if (opcode == ARPL_OPCODE_CHECK) {
+            *reinterpret_cast<uint16_t*>(p) = NOP_2BYTES;
+            g_state.arplFixed++;
+            g_state.patchesApplied++;
             changed = true;
-            i++; // Skip the next byte since we processed two
+            instruction_patched = true;
+            p += 2; // Advance by 2 bytes
         }
-        // Check for FCOMP ST(1) (Bytes D8 DC)
-        else if (current_opcode == FCOMP_CHECK_OPCODE) {
-            buffer[i] = FCOMP_ST0_BYTE_1; // Patch first byte (D8 -> D8)
-            buffer[i + 1] = FCOMP_ST0_BYTE_2; // Patch second byte (DC -> D8)
-            fcomp_patches++;
+        // Check for FCOMP ST(1) (D8 DC)
+        else if (opcode == FCOMP_CHECK_OPCODE) {
+            *reinterpret_cast<uint16_t*>(p) = FCOMP_ST0_OPCODE; // Patch to FCOMP ST(0)
+            g_state.fcompFixed++;
+            g_state.patchesApplied++;
             changed = true;
-            i++; // Skip the next byte since we processed two
+            instruction_patched = true;
+            p += 2; // Advance by 2 bytes
         }
-        // No need to increment 'i' here if no match, loop does it
+
+        // If we didn't patch, advance by 1 byte to check next position
+        if (!instruction_patched) {
+            p++;
+        }
     }
 
-    // 5. Write the potentially modified buffer back to the original filename
+    // Restore original protection only if we changed it
+    if (needsRestore) {
+        DWORD ignored;
+        VirtualProtect(baseAddr, size, oldProtect, &ignored);
+    }
+
+    // Flush cache if we made changes
     if (changed) {
-        std::ofstream outfile(input_filepath, std::ios::binary | std::ios::trunc); // Overwrite/create
-        if (!outfile) {
-            std::cerr << "Error: Cannot open output file for writing: " << input_filepath << std::endl;
-            std::cerr << "Original file is preserved as: " << backup_filepath << std::endl;
-            return 1;
-        }
-        if (!outfile.write(reinterpret_cast<const char*>(buffer.data()), buffer.size())) {
-            std::cerr << "Error: Failed to write patched content to output file." << std::endl;
-            outfile.close();
-            std::cerr << "Original file is preserved as: " << backup_filepath << std::endl;
-            return 1;
-        }
-        outfile.close(); // Ensure data is flushed
-        std::cout << "Patching successful!" << std::endl;
-        std::cout << "  ARPL instructions patched: " << arpl_patches << std::endl;
-        std::cout << "  FCOMP instructions patched: " << fcomp_patches << std::endl;
+        FlushInstructionCache(GetCurrentProcess(), baseAddr, size);
+    }
+}
+
+// Worker thread for optimizing memory in the current process
+DWORD WINAPI OptimizeThread(LPVOID param) {
+    // Get snapshot of modules for the *current* process
+    HANDLE hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (hModuleSnap == INVALID_HANDLE_VALUE) {
+        return 1; // Failed to get snapshot
+    }
+
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
+
+    if (Module32First(hModuleSnap, &me32)) {
+        do {
+            // Optimize the code section of each loaded module
+            OptimizeMemoryBlock(me32.modBaseAddr, me32.modBaseSize);
+        } while (Module32Next(hModuleSnap, &me32));
+    }
+
+    CloseHandle(hModuleSnap);
+    return 0;
+}
+
+// Sets up VEH and starts optimization thread *in the current process*
+void SetupExceptionHandlerAndOptimizer() {
+    // Install VEH handler (first chance handler)
+    g_state.vehHandler = AddVectoredExceptionHandler(1, VectoredHandler);
+    if (!g_state.vehHandler) {
+        MessageBoxA(NULL, "Failed to install Vectored Exception Handler!", "WineRosetta Error", MB_OK | MB_ICONERROR);
+    }
+
+    // Start background optimization thread
+    HANDLE hThread = CreateThread(NULL, 0, OptimizeThread, NULL, 0, NULL);
+    if (hThread) {
+        CloseHandle(hThread); // Close handle, thread continues running
     } else {
-        std::cout << "No target instructions found. Restoring original file." << std::endl;
-        // Restore original by renaming backup back
-        if (std::rename(backup_filepath.c_str(), input_filepath.c_str()) != 0) {
-            std::cerr << "Warning: Failed to automatically restore original file from backup." << std::endl;
-            std::cerr << "Original file is still available as: " << backup_filepath << std::endl;
+         MessageBoxA(NULL, "Failed to create optimization thread!", "WineRosetta Warning", MB_OK | MB_ICONWARNING);
+    }
+}
+
+// Creates the target process (suspended), potentially sets it up, and resumes
+BOOL CreateAndSetupProcess(const char* exePath) {
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+
+    // Create a mutable buffer for the command line argument
+    char cmdLine[MAX_PATH * 2]; // Allocate sufficient buffer
+    strncpy_s(cmdLine, sizeof(cmdLine), exePath, _TRUNCATE);
+
+
+    if (!CreateProcessA(
+            NULL,          // Application name (use lpCommandLine instead)
+            cmdLine,       // Command line (needs to be mutable)
+            NULL,          // Process handle not inheritable
+            NULL,          // Thread handle not inheritable
+            FALSE,         // Set handle inheritance to FALSE
+            CREATE_SUSPENDED, // Create suspended
+            NULL,          // Use parent's environment block
+            NULL,          // Use parent's starting directory
+            &si,           // Pointer to STARTUPINFO structure
+            &pi            // Pointer to PROCESS_INFORMATION structure
+           ))
+    {
+        char msg[256];
+        sprintf_s(msg, sizeof(msg), "Failed to create process: %s (Error %lu)", exePath, GetLastError());
+        MessageBoxA(NULL, msg, "WineRosetta Error", MB_OK | MB_ICONERROR);
+        return FALSE;
+    }
+
+    // Store process information globally
+    g_state.hProcess = pi.hProcess;
+    g_state.hThread = pi.hThread;
+    g_state.processId = pi.dwProcessId;
+
+
+    // Resume the main thread of the new process
+    if (ResumeThread(pi.hThread) == (DWORD)-1) {
+        char msg[256];
+        sprintf_s(msg, sizeof(msg), "Failed to resume process thread (Error %lu)", GetLastError());
+        MessageBoxA(NULL, msg, "WineRosetta Error", MB_OK | MB_ICONERROR);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        g_state.hProcess = NULL;
+        g_state.hThread = NULL;
+        return FALSE;
+    }
+
+    // Don't close pi.hProcess/hThread here, we need them later for WaitForSingleObject etc.
+    // They will be closed at the end of WinMain.
+
+    return TRUE;
+}
+
+// Main entry point
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // Determine target executable path
+    const char* exePathCStr = ".\\wow.exe"; // Default target
+    char actualExePath[MAX_PATH]; // Buffer to hold the final path
+
+    if (lpCmdLine && *lpCmdLine) {
+        // Handle potential quotes around the path
+        if (lpCmdLine[0] == '"') {
+            strncpy_s(actualExePath, sizeof(actualExePath), lpCmdLine + 1, _TRUNCATE);
+            char* lastQuote = strrchr(actualExePath, '"');
+            if (lastQuote) {
+                *lastQuote = '\0'; // Null-terminate at the closing quote
+            }
         } else {
-            // Successfully renamed back, maybe remove the now-redundant backup? Optional.
-            // std::remove(backup_filepath.c_str());
+            strncpy_s(actualExePath, sizeof(actualExePath), lpCmdLine, _TRUNCATE);
         }
+        exePathCStr = actualExePath; // Point to the processed path
+    } else {
+         strncpy_s(actualExePath, sizeof(actualExePath), exePathCStr, _TRUNCATE);
+    }
+
+
+    char msg[512];
+    sprintf_s(msg, sizeof(msg), "WineRosetta starting target:\n%s\n\nCompatibility patches for ARPL/FCOMP will be applied.", exePathCStr);
+    MessageBoxA(NULL, msg, "WineRosetta", MB_OK | MB_ICONINFORMATION);
+
+    // Set up exception handling and optimization for THIS process (the launcher)
+    // The VEH *might* be inherited by the child depending on circumstances.
+    SetupExceptionHandlerAndOptimizer();
+
+    // Create and start the target process
+    if (!CreateAndSetupProcess(exePathCStr)) {
+        if (g_state.vehHandler) {
+            RemoveVectoredExceptionHandler(g_state.vehHandler);
+        }
+        return 1;
+    }
+
+    // Wait for the target process to finish
+    if (g_state.hProcess) {
+        WaitForSingleObject(g_state.hProcess, INFINITE);
+
+        DWORD exitCode = 0;
+        GetExitCodeProcess(g_state.hProcess, &exitCode);
+
+        // Display statistics (using atomic loads)
+        sprintf_s(msg, sizeof(msg),
+                  "Process exited with code %lu\n\n"
+                  "Total patches (Runtime + Proactive): %ld\n"
+                  "ARPL instructions fixed: %ld\n"
+                  "FCOMP instructions fixed: %ld",
+                  exitCode,
+                  g_state.patchesApplied.load(std::memory_order_relaxed), // Use relaxed for final report
+                  g_state.arplFixed.load(std::memory_order_relaxed),
+                  g_state.fcompFixed.load(std::memory_order_relaxed));
+        MessageBoxA(NULL, msg, "WineRosetta - Process Finished", MB_OK | MB_ICONINFORMATION);
+
+        // Clean up process handles now that we're done with them
+        CloseHandle(g_state.hProcess);
+        CloseHandle(g_state.hThread);
+        g_state.hProcess = NULL; // Nullify handles after closing
+        g_state.hThread = NULL;
+    }
+
+    // Remove the exception handler before exiting the launcher
+    if (g_state.vehHandler) {
+        RemoveVectoredExceptionHandler(g_state.vehHandler);
+        g_state.vehHandler = nullptr; // Nullify handle after removing
     }
 
     return 0;
