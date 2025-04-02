@@ -63,7 +63,7 @@ The project can be built as either a standalone launcher or as a DLL:
 Use the following command to compile the executable on a Linux system with MinGW:
 
 ```
-i686-w64-mingw32-g++ -o winerosetta2.exe winerosetta.cpp -static -static-libgcc -static-libstdc++ -std=c++11 -Wall -O2
+i686-w64-mingw32-g++ -o winerosetta2.exe winerosetta2.cpp -static -static-libgcc -static-libstdc++ -std=c++11 -Wall -O2
 ```
 
 This will create a statically linked 32-bit Windows executable that can be used with Wine.
