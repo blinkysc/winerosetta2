@@ -15,13 +15,18 @@ constexpr DWORD RPL_MASK = 0x3;
 // Global binary translator state
 struct {
     // Memory protection hook data
-    PVOID oldVehHandler;
+    PVOID vehHandler;
     
     // Patch statistics
     volatile LONG patchesApplied;
     volatile LONG arplFixed;
     volatile LONG fcompFixed;
-} g_state = {nullptr, 0, 0, 0};
+    
+    // Process info
+    HANDLE hProcess;
+    HANDLE hThread;
+    DWORD processId;
+} g_state = {nullptr, 0, 0, 0, NULL, NULL, 0};
 
 // Interrupt hook handler to intercept illegal instructions
 LONG WINAPI VectoredHandler(EXCEPTION_POINTERS* ExceptionInfo) {
@@ -141,7 +146,7 @@ void OptimizeMemoryBlock(void* baseAddr, SIZE_T size) {
     FlushInstructionCache(GetCurrentProcess(), baseAddr, size);
 }
 
-// Worker thread for optimizing memory
+// Worker thread for optimizing memory in the current process
 DWORD WINAPI OptimizeThread(LPVOID param) {
     // Get a snapshot of all modules
     HANDLE hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -167,8 +172,11 @@ DWORD WINAPI OptimizeThread(LPVOID param) {
     return 0;
 }
 
-// Initialize our system
-void InitializeOptimizer() {
+// Function to set up the exception handler for the child process
+void SetupChildProcess() {
+    // Install VEH handler for runtime exceptions
+    g_state.vehHandler = AddVectoredExceptionHandler(1, VectoredHandler);
+    
     // Start a thread to scan and optimize all code
     HANDLE hThread = CreateThread(NULL, 0, OptimizeThread, NULL, 0, NULL);
     if (hThread) {
@@ -176,43 +184,36 @@ void InitializeOptimizer() {
         SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
         CloseHandle(hThread);
     }
+}
+
+// Creates and sets up a new process from inside the current process
+BOOL CreateAndSetupProcess(const char* exePath) {
+    // Create process
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {0};
     
-    // Install VEH handler as a backup
-    g_state.oldVehHandler = AddVectoredExceptionHandler(1, VectoredHandler);
-}
-
-// Clean up
-void ShutdownOptimizer() {
-    if (g_state.oldVehHandler) {
-        RemoveVectoredExceptionHandler(g_state.oldVehHandler);
-        g_state.oldVehHandler = NULL;
+    // Create process with our process as the parent
+    if (!CreateProcessA(exePath, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, 
+                       NULL, NULL, &si, &pi)) {
+        char msg[256];
+        wsprintfA(msg, "Failed to create process: %s (Error %d)", exePath, GetLastError());
+        MessageBoxA(NULL, msg, "WineRosetta Error", MB_OK | MB_ICONERROR);
+        return FALSE;
     }
-}
-
-// DLL entry point
-BOOL WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
-    switch (dwReason) {
-        case DLL_PROCESS_ATTACH:
-            // Don't need thread notifications
-            DisableThreadLibraryCalls(hModule);
-            
-            // Initialize our optimizer
-            InitializeOptimizer();
-            break;
-            
-        case DLL_PROCESS_DETACH:
-            // Clean up
-            ShutdownOptimizer();
-            break;
-    }
+    
+    // Store the process information
+    g_state.hProcess = pi.hProcess;
+    g_state.hThread = pi.hThread;
+    g_state.processId = pi.dwProcessId;
+    
+    // Resume the process now
+    ResumeThread(pi.hThread);
     
     return TRUE;
 }
 
-// Simple launcher code
-#ifndef BUILD_AS_DLL
-// Minimal command-line executable - no iostream, no filesystem
-// This is the simplest possible implementation to avoid external dependencies
+// Main entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     // Default target
     const char* exePath = ".\\wow.exe";
@@ -222,101 +223,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         exePath = lpCmdLine;
     }
     
-    // Get full path to our DLL
-    char dllPath[MAX_PATH];
-    GetModuleFileNameA(NULL, dllPath, MAX_PATH);
+    // Show startup message
+    char msg[512];
+    wsprintfA(msg, "WineRosetta is starting %s\n\nThis will apply compatibility patches for problematic x86 instructions.", exePath);
+    MessageBoxA(NULL, msg, "WineRosetta", MB_OK | MB_ICONINFORMATION);
     
-    // Change extension from .exe to .dll
-    size_t len = lstrlenA(dllPath);
-    if (len > 4) {
-        dllPath[len-3] = 'd';
-        dllPath[len-2] = 'l';
-        dllPath[len-1] = 'l';
-    }
+    // Set up our current process to handle exceptions
+    SetupChildProcess();
     
-    // Create process
-    STARTUPINFOA si = {0};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {0};
-    
-    // Create suspended process
-    if (!CreateProcessA(exePath, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, 
-                         NULL, NULL, &si, &pi)) {
-        char msg[256];
-        wsprintfA(msg, "Failed to create process: %d", GetLastError());
-        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
+    // Create and set up the target process
+    if (!CreateAndSetupProcess(exePath)) {
         return 1;
     }
     
-    // Allocate memory for DLL path
-    void* remoteMem = VirtualAllocEx(pi.hProcess, NULL, lstrlenA(dllPath) + 1,
-                                    MEM_COMMIT, PAGE_READWRITE);
-    if (!remoteMem) {
-        char msg[256];
-        wsprintfA(msg, "Memory allocation failed: %d", GetLastError());
-        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return 1;
+    // Wait for the child process to exit
+    if (g_state.hProcess) {
+        WaitForSingleObject(g_state.hProcess, INFINITE);
+        
+        // Get exit code
+        DWORD exitCode = 0;
+        GetExitCodeProcess(g_state.hProcess, &exitCode);
+        
+        // Display statistics
+        wsprintfA(msg, "Process exited with code %d\n\nPatches applied: %d\nARPL instructions fixed: %d\nFCOMP instructions fixed: %d", 
+                 exitCode, g_state.patchesApplied, g_state.arplFixed, g_state.fcompFixed);
+        MessageBoxA(NULL, msg, "WineRosetta", MB_OK | MB_ICONINFORMATION);
+        
+        // Clean up
+        CloseHandle(g_state.hProcess);
+        CloseHandle(g_state.hThread);
     }
     
-    // Write DLL path
-    if (!WriteProcessMemory(pi.hProcess, remoteMem, dllPath, lstrlenA(dllPath) + 1, NULL)) {
-        char msg[256];
-        wsprintfA(msg, "WriteProcessMemory failed: %d", GetLastError());
-        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
-        VirtualFreeEx(pi.hProcess, remoteMem, 0, MEM_RELEASE);
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return 1;
+    // Remove exception handler
+    if (g_state.vehHandler) {
+        RemoveVectoredExceptionHandler(g_state.vehHandler);
     }
-    
-    // Get LoadLibraryA address
-    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
-    FARPROC loadLibrary = GetProcAddress(kernel32, "LoadLibraryA");
-    
-    // Create remote thread
-    HANDLE hThread = CreateRemoteThread(pi.hProcess, NULL, 0, 
-                                       (LPTHREAD_START_ROUTINE)loadLibrary,
-                                       remoteMem, 0, NULL);
-    if (!hThread) {
-        char msg[256];
-        wsprintfA(msg, "CreateRemoteThread failed: %d", GetLastError());
-        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
-        VirtualFreeEx(pi.hProcess, remoteMem, 0, MEM_RELEASE);
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return 1;
-    }
-    
-    // Wait for DLL to load
-    WaitForSingleObject(hThread, INFINITE);
-    
-    // Check result
-    DWORD exitCode = 0;
-    GetExitCodeThread(hThread, &exitCode);
-    
-    // Clean up
-    CloseHandle(hThread);
-    VirtualFreeEx(pi.hProcess, remoteMem, 0, MEM_RELEASE);
-    
-    // Resume process
-    if (exitCode != 0) {
-        // DLL loaded successfully
-        ResumeThread(pi.hThread);
-        MessageBoxA(NULL, "Process started with WineRosetta", "Success", MB_OK | MB_ICONINFORMATION);
-    } else {
-        // DLL load failed
-        TerminateProcess(pi.hProcess, 1);
-        MessageBoxA(NULL, "Failed to load DLL", "Error", MB_OK | MB_ICONERROR);
-    }
-    
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
     
     return 0;
 }
-#endif
