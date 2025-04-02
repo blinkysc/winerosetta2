@@ -242,6 +242,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Create suspended process
     if (!CreateProcessA(exePath, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, 
                          NULL, NULL, &si, &pi)) {
+        char msg[256];
+        wsprintfA(msg, "Failed to create process: %d", GetLastError());
+        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
         return 1;
     }
     
@@ -249,6 +252,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     void* remoteMem = VirtualAllocEx(pi.hProcess, NULL, lstrlenA(dllPath) + 1,
                                     MEM_COMMIT, PAGE_READWRITE);
     if (!remoteMem) {
+        char msg[256];
+        wsprintfA(msg, "Memory allocation failed: %d", GetLastError());
+        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -257,6 +263,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Write DLL path
     if (!WriteProcessMemory(pi.hProcess, remoteMem, dllPath, lstrlenA(dllPath) + 1, NULL)) {
+        char msg[256];
+        wsprintfA(msg, "WriteProcessMemory failed: %d", GetLastError());
+        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
         VirtualFreeEx(pi.hProcess, remoteMem, 0, MEM_RELEASE);
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);
@@ -273,6 +282,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                        (LPTHREAD_START_ROUTINE)loadLibrary,
                                        remoteMem, 0, NULL);
     if (!hThread) {
+        char msg[256];
+        wsprintfA(msg, "CreateRemoteThread failed: %d", GetLastError());
+        MessageBoxA(NULL, msg, "Error", MB_OK | MB_ICONERROR);
         VirtualFreeEx(pi.hProcess, remoteMem, 0, MEM_RELEASE);
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);
@@ -291,11 +303,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CloseHandle(hThread);
     VirtualFreeEx(pi.hProcess, remoteMem, 0, MEM_RELEASE);
     
-    // Resume process if DLL loaded successfully
+    // Resume process
     if (exitCode != 0) {
+        // DLL loaded successfully
         ResumeThread(pi.hThread);
+        MessageBoxA(NULL, "Process started with WineRosetta", "Success", MB_OK | MB_ICONINFORMATION);
     } else {
+        // DLL load failed
         TerminateProcess(pi.hProcess, 1);
+        MessageBoxA(NULL, "Failed to load DLL", "Error", MB_OK | MB_ICONERROR);
     }
     
     CloseHandle(pi.hProcess);
