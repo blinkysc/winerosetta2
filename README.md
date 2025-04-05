@@ -1,6 +1,6 @@
 # WineRosetta2
 
-A lightweight JIT (Just-In-Time) binary translator specifically designed to fix issues with World of Warcraft Classic versions running in Wine on Apple Silicon Macs (M1, M2, M3, M4) by handling problematic x86 instructions that cause issues with Rosetta 2 translation.
+A lightweight JIT (Just-In-Time) binary translator specifically designed to address issues with World of Warcraft Classic versions running in Wine on Apple Silicon Macs (M1, M2, M3, M4) by handling problematic x86 instructions that cause conflicts with Rosetta 2 translation. Despite these improvements, performance remains significantly limited, with users typically experiencing around 5 FPS, making gameplay still quite challenging.
 
 ## Introduction
 
