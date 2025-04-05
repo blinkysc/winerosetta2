@@ -75,13 +75,3 @@ This implementation is based on the work by [Lifeisawful](https://github.com/Lif
 ## License
 
 The original WineRosetta project by [Lifeisawful](https://github.com/Lifeisawful/winerosetta) is licensed under the MIT license.
-
-## Technical Details
-
-### ARPL Instruction
-
-The ARPL instruction adjusts the Requested Privilege Level (RPL) bits of a segment selector. It's rarely used in modern applications but can cause issues in Wine. WineRosetta replaces it with NOPs or emulates it when encountered.
-
-### FCOMP Instruction
-
-Some variants of the FCOMP floating-point comparison instruction may cause compatibility issues. WineRosetta replaces these with more compatible variants.
