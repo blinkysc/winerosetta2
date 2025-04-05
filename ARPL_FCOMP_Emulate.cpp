@@ -1,3 +1,11 @@
+/*
+ * DISCLAIMER: This is an experimental implementation that DOES NOT WORK.
+ * It was created to test the feasibility of emulating problematic x86 instructions in Wine
+ * on Apple Silicon, but the application simply crashes when using this emulator,
+ * exhibiting the same behavior as if not using the JIT at all.
+ * This should be considered a failed experiment and is provided for reference only.
+ */
+
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>      // For sprintf_s (safer alternative to wsprintfA)
