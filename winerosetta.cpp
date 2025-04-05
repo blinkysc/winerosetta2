@@ -1,263 +1,202 @@
 #include <windows.h>
 #include <cstdint>
-#include <tlhelp32.h>
+#include <cstdio>
 
-// Target problematic instructions
+// Target opcodes
 constexpr uint16_t ARPL_OPCODE = 0xD063;
 constexpr uint16_t FCOMP_OPCODE = 0xD8DC;
 constexpr uint16_t FCOMP_ST0_OPCODE = 0xD8D8;
-constexpr uint16_t NOP_2BYTES = 0x9090;
 
 // For ZF flag
 constexpr DWORD ZF_FLAG = 0x40;
 constexpr DWORD RPL_MASK = 0x3;
 
-// Global binary translator state
-struct {
-    // Memory protection hook data
-    PVOID vehHandler;
-    
-    // Patch statistics
-    volatile LONG patchesApplied;
-    volatile LONG arplFixed;
-    volatile LONG fcompFixed;
-    
-    // Process info
-    HANDLE hProcess;
-    HANDLE hThread;
-    DWORD processId;
-} g_state = {nullptr, 0, 0, 0, NULL, NULL, 0};
+// Statistics for debugging
+struct PatchStats {
+    volatile LONG totalExceptions;
+    volatile LONG arplHandled;
+    volatile LONG fcompHandled;
+    volatile LONG patchesMade;
+} g_stats = {0};
 
-// Interrupt hook handler to intercept illegal instructions
-LONG WINAPI VectoredHandler(EXCEPTION_POINTERS* ExceptionInfo) {
+// Function to safely patch memory - no exception handling, just direct approach
+bool PatchInstruction(void* address, uint16_t newOpcode) {
+    DWORD oldProtect;
+    
+    // Try to change memory protection
+    if (!VirtualProtect(address, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        return false;
+    }
+    
+    // Write the new opcode
+    *reinterpret_cast<uint16_t*>(address) = newOpcode;
+    
+    // Restore protection
+    VirtualProtect(address, 2, oldProtect, &oldProtect);
+    
+    // Flush instruction cache to ensure the CPU sees the change
+    FlushInstructionCache(GetCurrentProcess(), address, 2);
+    
+    // Record successful patch
+    InterlockedIncrement(&g_stats.patchesMade);
+    
+    return true;
+}
+
+// Check if a memory address is valid and accessible
+bool IsAddressAccessible(void* address, size_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    
+    // Check if memory is committed and accessible
+    if (mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    
+    // Check if it's readable
+    if ((mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) {
+        return false;
+    }
+    
+    // Check if memory block is large enough
+    uintptr_t blockEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    uintptr_t requestedEnd = reinterpret_cast<uintptr_t>(address) + size;
+    if (requestedEnd > blockEnd) {
+        return false;
+    }
+    
+    return true;
+}
+
+// Helper function to safely read memory
+bool SafeReadMemory(void* address, void* buffer, size_t size) {
+    if (!IsAddressAccessible(address, size)) {
+        return false;
+    }
+    
+    memcpy(buffer, address, size);
+    return true;
+}
+
+// Our primary vectored exception handler
+LONG WINAPI VectoredHandler(struct _EXCEPTION_POINTERS* ExceptionInfo) {
+    // Count all exceptions for statistics
+    InterlockedIncrement(&g_stats.totalExceptions);
+    
     // Only handle illegal instruction exceptions
     if (ExceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     
-    ULONG_PTR faultAddr = reinterpret_cast<ULONG_PTR>(ExceptionInfo->ExceptionRecord->ExceptionAddress);
+    // Get the context and address
+    auto context = ExceptionInfo->ContextRecord;
+    void* instructionAddress = ExceptionInfo->ExceptionRecord->ExceptionAddress;
     
-    // Check if it's a valid memory location
-    if (!IsBadReadPtr(reinterpret_cast<void*>(faultAddr), 2)) {
-        uint16_t opcode = *reinterpret_cast<uint16_t*>(faultAddr);
+    // Safely read the opcode
+    uint16_t opcode = 0;
+    if (!SafeReadMemory(instructionAddress, &opcode, sizeof(opcode))) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    
+    // Handle ARPL instruction
+    if (opcode == ARPL_OPCODE) {
+        InterlockedIncrement(&g_stats.arplHandled);
         
-        // Handle ARPL
-        if (opcode == ARPL_OPCODE) {
-            // Call our ARPL emulation
-            auto dest = &ExceptionInfo->ContextRecord->Eax;
-            auto src = &ExceptionInfo->ContextRecord->Edx;
-            
-            uint16_t destVal = static_cast<uint16_t>(*dest);
-            uint16_t srcVal = static_cast<uint16_t>(*src);
-            
-            if ((destVal & RPL_MASK) < (srcVal & RPL_MASK)) {
-                // Set ZF
-                ExceptionInfo->ContextRecord->EFlags |= ZF_FLAG;
-                
-                // Update destination
-                destVal = (destVal & ~RPL_MASK) | (srcVal & RPL_MASK);
-                *dest = (*dest & 0xFFFF0000) | destVal;
-            } else {
-                // Clear ZF
-                ExceptionInfo->ContextRecord->EFlags &= ~ZF_FLAG;
-            }
-            
-            // Skip the instruction
-            ExceptionInfo->ContextRecord->Eip += 2;
-            
-            // Attempt to patch with NOPs for next time
-            DWORD oldProtect;
-            if (VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                *reinterpret_cast<uint16_t*>(faultAddr) = NOP_2BYTES;
-                VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, oldProtect, &oldProtect);
-                InterlockedIncrement(&g_state.arplFixed);
-            }
-            
+        // Extract operands
+        uint16_t dest = static_cast<uint16_t>(context->Eax);
+        uint16_t src = static_cast<uint16_t>(context->Edx);
+        
+        // Implement ARPL logic
+        /*
+        IF RPL bits(0,1) of DEST < RPL bits(0,1) of SRC
+        THEN
+            ZF := 1;
+            RPL bits(0,1) of DEST := RPL bits(0,1) of SRC;
+        ELSE
+            ZF := 0;
+        FI;
+        */
+        if ((dest & RPL_MASK) < (src & RPL_MASK)) {
+            context->EFlags |= ZF_FLAG;  // Set ZF
+            dest = (dest & ~RPL_MASK) | (src & RPL_MASK);
+            context->Eax = (context->Eax & 0xFFFF0000) | dest;
+        } else {
+            context->EFlags &= ~ZF_FLAG; // Clear ZF
+        }
+        
+        // Skip the instruction
+        context->Eip += 2;
+        
+        // Try to patch this location for next time, but don't worry if it fails
+        PatchInstruction(instructionAddress, 0x9090); // NOP, NOP
+        
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    
+    // Handle FCOMP instruction
+    if (opcode == FCOMP_OPCODE) {
+        InterlockedIncrement(&g_stats.fcompHandled);
+        
+        // Try to patch the instruction in-place
+        if (PatchInstruction(instructionAddress, FCOMP_ST0_OPCODE)) {
+            // Successfully patched, let CPU re-execute
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         
-        // Handle FCOMP
-        if (opcode == FCOMP_OPCODE) {
-            // Replace with FCOMP ST0
-            DWORD oldProtect;
-            if (VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                *reinterpret_cast<uint16_t*>(faultAddr) = FCOMP_ST0_OPCODE;
-                VirtualProtect(reinterpret_cast<void*>(faultAddr), 2, oldProtect, &oldProtect);
-                InterlockedIncrement(&g_state.fcompFixed);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-        }
+        // If patching failed, continue search for another handler
+        return EXCEPTION_CONTINUE_SEARCH;
     }
     
+    // Not our instruction
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// Optimize a memory block
-void OptimizeMemoryBlock(void* baseAddr, SIZE_T size) {
-    // Can't optimize NULL or tiny blocks
-    if (!baseAddr || size < 2) {
-        return;
+// Optional debug function to print to a log file
+void WriteDebugLog(const char* format, ...) {
+#ifdef DEBUG_OUTPUT
+    FILE* f = fopen("winerosetta_debug.log", "a");
+    if (f) {
+        va_list args;
+        va_start(args, format);
+        vfprintf(f, format, args);
+        va_end(args);
+        fclose(f);
     }
+#endif
+}
+
+BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
+    static PVOID exceptionHandler = NULL;
     
-    // Skip non-executable memory
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(baseAddr, &mbi, sizeof(mbi)) == 0) {
-        return;
-    }
-    
-    if (!(mbi.Protect & PAGE_EXECUTE) && 
-        !(mbi.Protect & PAGE_EXECUTE_READ) && 
-        !(mbi.Protect & PAGE_EXECUTE_READWRITE) && 
-        !(mbi.Protect & PAGE_EXECUTE_WRITECOPY)) {
-        return;
-    }
-    
-    // Make memory temporarily writable
-    DWORD oldProtect;
-    if (!VirtualProtect(baseAddr, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        return;
-    }
-    
-    // Scan for and fix problematic instructions
-    uint8_t* start = static_cast<uint8_t*>(baseAddr);
-    uint8_t* end = start + size - 1;  // Need at least 2 bytes for 16-bit opcodes
-    
-    for (uint8_t* p = start; p < end; p++) {
-        uint16_t opcode = *reinterpret_cast<uint16_t*>(p);
-        
-        // Fix ARPL instructions by replacing with NOPs
-        if (opcode == ARPL_OPCODE) {
-            *reinterpret_cast<uint16_t*>(p) = NOP_2BYTES;
-            InterlockedIncrement(&g_state.arplFixed);
-            InterlockedIncrement(&g_state.patchesApplied);
+    switch (reason) {
+        case DLL_PROCESS_ATTACH: {
+            // Disable thread attach/detach notifications
+            DisableThreadLibraryCalls(hModule);
+            
+            // Register our exception handler with highest priority (1)
+            exceptionHandler = AddVectoredExceptionHandler(1, VectoredHandler);
+            
+            // For debugging in development
+            WriteDebugLog("WineRosetta DLL loaded, handler: %p\n", exceptionHandler);
+            
+            break;
         }
-        // Fix FCOMP instruction
-        else if (opcode == FCOMP_OPCODE) {
-            *reinterpret_cast<uint16_t*>(p) = FCOMP_ST0_OPCODE;
-            InterlockedIncrement(&g_state.fcompFixed);
-            InterlockedIncrement(&g_state.patchesApplied);
+            
+        case DLL_PROCESS_DETACH: {
+            // Remove exception handler if it was registered
+            if (exceptionHandler) {
+                RemoveVectoredExceptionHandler(exceptionHandler);
+                exceptionHandler = NULL;
+                
+                WriteDebugLog("WineRosetta unloaded. Stats: Total=%ld, ARPL=%ld, FCOMP=%ld, Patches=%ld\n",
+                             g_stats.totalExceptions, g_stats.arplHandled, 
+                             g_stats.fcompHandled, g_stats.patchesMade);
+            }
+            break;
         }
     }
-    
-    // Restore original protection
-    VirtualProtect(baseAddr, size, oldProtect, &oldProtect);
-    
-    // Ensure CPU sees the changes
-    FlushInstructionCache(GetCurrentProcess(), baseAddr, size);
-}
-
-// Worker thread for optimizing memory in the current process
-DWORD WINAPI OptimizeThread(LPVOID param) {
-    // Get a snapshot of all modules
-    HANDLE hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (hModuleSnap == INVALID_HANDLE_VALUE) {
-        return 1;
-    }
-    
-    // Prepare module entry
-    MODULEENTRY32 me32;
-    me32.dwSize = sizeof(MODULEENTRY32);
-    
-    // Iterate through modules
-    if (Module32First(hModuleSnap, &me32)) {
-        do {
-            // Optimize each module's code section
-            OptimizeMemoryBlock(me32.modBaseAddr, me32.modBaseSize);
-        } while (Module32Next(hModuleSnap, &me32));
-    }
-    
-    // Clean up
-    CloseHandle(hModuleSnap);
-    
-    return 0;
-}
-
-// Function to set up the exception handler for the child process
-void SetupChildProcess() {
-    // Install VEH handler for runtime exceptions
-    g_state.vehHandler = AddVectoredExceptionHandler(1, VectoredHandler);
-    
-    // Start a thread to scan and optimize all code
-    HANDLE hThread = CreateThread(NULL, 0, OptimizeThread, NULL, 0, NULL);
-    if (hThread) {
-        // Set to high priority for faster startup optimization
-        SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
-        CloseHandle(hThread);
-    }
-}
-
-// Creates and sets up a new process from inside the current process
-BOOL CreateAndSetupProcess(const char* exePath) {
-    // Create process
-    STARTUPINFOA si = {0};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {0};
-    
-    // Create process with our process as the parent
-    if (!CreateProcessA(exePath, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, 
-                       NULL, NULL, &si, &pi)) {
-        char msg[256];
-        wsprintfA(msg, "Failed to create process: %s (Error %d)", exePath, GetLastError());
-        MessageBoxA(NULL, msg, "WineRosetta Error", MB_OK | MB_ICONERROR);
-        return FALSE;
-    }
-    
-    // Store the process information
-    g_state.hProcess = pi.hProcess;
-    g_state.hThread = pi.hThread;
-    g_state.processId = pi.dwProcessId;
-    
-    // Resume the process now
-    ResumeThread(pi.hThread);
     
     return TRUE;
-}
-
-// Main entry point
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    // Default target
-    const char* exePath = ".\\wow.exe";
-    
-    // Use command line if provided
-    if (lpCmdLine && *lpCmdLine) {
-        exePath = lpCmdLine;
-    }
-    
-    // Show startup message
-    char msg[512];
-    wsprintfA(msg, "WineRosetta is starting %s\n\nThis will apply compatibility patches for problematic x86 instructions.", exePath);
-    MessageBoxA(NULL, msg, "WineRosetta", MB_OK | MB_ICONINFORMATION);
-    
-    // Set up our current process to handle exceptions
-    SetupChildProcess();
-    
-    // Create and set up the target process
-    if (!CreateAndSetupProcess(exePath)) {
-        return 1;
-    }
-    
-    // Wait for the child process to exit
-    if (g_state.hProcess) {
-        WaitForSingleObject(g_state.hProcess, INFINITE);
-        
-        // Get exit code
-        DWORD exitCode = 0;
-        GetExitCodeProcess(g_state.hProcess, &exitCode);
-        
-        // Display statistics
-        wsprintfA(msg, "Process exited with code %d\n\nPatches applied: %d\nARPL instructions fixed: %d\nFCOMP instructions fixed: %d", 
-                 exitCode, g_state.patchesApplied, g_state.arplFixed, g_state.fcompFixed);
-        MessageBoxA(NULL, msg, "WineRosetta", MB_OK | MB_ICONINFORMATION);
-        
-        // Clean up
-        CloseHandle(g_state.hProcess);
-        CloseHandle(g_state.hThread);
-    }
-    
-    // Remove exception handler
-    if (g_state.vehHandler) {
-        RemoveVectoredExceptionHandler(g_state.vehHandler);
-    }
-    
-    return 0;
 }
