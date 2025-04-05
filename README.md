@@ -15,12 +15,11 @@ This approach is minimally invasive while providing the necessary fixes to run W
 
 ## Overview
 
-WineRosetta2 is a dynamic binary translator that targets specific problematic x86 instructions that cause issues when running World of Warcraft Classic through Wine on Apple Silicon Macs using Rosetta 2. It primarily fixes:
+WineRosetta2 is a dynamic binary translator that attempts to address problematic x86 instructions that cause issues when running World of Warcraft Classic through Wine on Apple Silicon Macs using Rosetta 2. 
 
-- `ARPL` (Adjust RPL Field of Selector) - replaces with NOPs
-- `FCOMP` instructions - replaces with compatible alternatives
+While initial development focused on `ARPL` and `FCOMP` instructions, testing has revealed that the actual problematic instructions may be different or more complex than originally thought. This tool represents an experimental approach to identifying and handling instructions that cause translation conflicts between Wine and Rosetta 2.
 
-These instructions can cause crashes or illegal instruction exceptions when translated by Rosetta 2 on Apple Silicon processors.
+These unidentified problematic instructions can cause crashes or illegal instruction exceptions when translated by Rosetta 2 on Apple Silicon processors.
 
 The tool works by:
 1. Pre-scanning executable memory to patch known problematic instructions
@@ -30,19 +29,15 @@ The tool works by:
 
 ### Installation and Usage
 
-1. Place `WineRosetta2.exe` in the same directory as your `wow.exe` executable
-2. Simply run `WineRosetta2.exe` (no command-line arguments are needed)
+1. Compile both the EXE and DLL versions of WineRosetta2
+2. Place both `WineRosetta2.exe` and `WineRosetta2.dll` in the same directory as your `wow.exe` executable
+3. Run `WineRosetta2.exe` (no command-line arguments are needed)
 
 The tool will automatically locate and launch the `wow.exe` file in the same directory. It does not accept any command-line arguments.
 
+**Important**: Both the EXE and DLL files must be present in the same directory for proper functionality.
+
 This is particularly useful for World of Warcraft Classic versions running on Apple Silicon Macs (M1-M4) through Wine, where Rosetta 2 translation issues can cause crashes.
-
-### As a DLL
-
-You can also compile WineRosetta2 as a DLL and inject it into an existing process:
-
-1. Compile with the `BUILD_AS_DLL` flag
-2. Use your preferred DLL injection method
 
 ## How It Works
 
@@ -53,20 +48,28 @@ WineRosetta2 uses two approaches to handle problematic instructions:
 
 ## Building
 
-The project can be built as either a standalone launcher or as a DLL:
+The project must be built as both a standalone launcher and as a DLL:
 
 - **Launcher**: Build without the `BUILD_AS_DLL` flag
 - **DLL**: Build with the `BUILD_AS_DLL` flag
 
-### Compilation Command
+You need to compile both versions and place them in the same directory as your WoW executable.
 
-Use the following command to compile the executable on a Linux system with MinGW:
+### Compilation Commands
 
+Use the following commands to compile both versions on a Linux system with MinGW:
+
+For the EXE:
 ```
 i686-w64-mingw32-g++ -o winerosetta2.exe winerosetta2.cpp -static -static-libgcc -static-libstdc++ -std=c++11 -Wall -O2
 ```
 
-This will create a statically linked 32-bit Windows executable that can be used with Wine.
+For the DLL:
+```
+i686-w64-mingw32-g++ -o winerosetta2.dll winerosetta2.cpp -shared -DBUILD_AS_DLL -static -static-libgcc -static-libstdc++ -std=c++11 -Wall -O2
+```
+
+This will create statically linked 32-bit Windows binaries that can be used with Wine.
 
 ## Credits
 
